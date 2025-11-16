@@ -5,7 +5,9 @@
 
 import gc
 import logging
+import os
 from functools import partial
+from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
@@ -300,6 +302,7 @@ class SSLMetaArch(nn.Module):
         self.student.ibot_head.init_weights()
         self.dino_loss.init_weights()
         self.ibot_patch_loss.init_weights()
+        self._maybe_load_pretrained_student()
         self.model_ema.load_state_dict(self.student.state_dict())
         if self.has_gram_teacher:
             if self.gram_ckpt is not None:
@@ -347,6 +350,117 @@ class SSLMetaArch(nn.Module):
                 self.teacher.dino_head.init_weights()
                 self.teacher.ibot_head.init_weights()
             logger.info(f"Performing distillation from: {self.teacher}")
+
+    def _maybe_load_pretrained_student(self) -> None:
+        preload_source = getattr(self.cfg.student, "pretrained_weights", "")
+        if preload_source in (None, "", "ignore"):
+            return
+        hf_token = self._resolve_hf_auth_token()
+        try:
+            checkpoint_path = self._resolve_pretrained_checkpoint(preload_source, hf_token)
+        except Exception:
+            logger.exception(
+                f"Failed to resolve pretrained weights from '{preload_source}'. "
+                "Student will keep random initialization."
+            )
+            return
+
+        try:
+            state_dict = self._load_state_dict_from_path(checkpoint_path)
+        except Exception:
+            logger.exception(
+                f"Failed to load pretrained weights from '{checkpoint_path}'. "
+                "Student will keep random initialization."
+            )
+            return
+
+        logger.info(f"Loaded pretrained weights for student backbone from {checkpoint_path}")
+        load_msg = self.student.load_state_dict(state_dict, strict=False)
+        missing = [k for k in load_msg.missing_keys if not k.startswith(("dino_head.", "ibot_head."))]
+        unexpected = load_msg.unexpected_keys
+        if missing:
+            logger.warning(f"Missing keys while loading pretrained weights: {missing}")
+        if unexpected:
+            logger.warning(f"Unexpected keys while loading pretrained weights: {unexpected}")
+
+    def _resolve_hf_auth_token(self) -> str | None:
+        token = getattr(self.cfg.student, "pretrained_weights_token", None)
+        if token:
+            return token
+        for env_var in (
+            "HF_TOKEN",
+            "HUGGINGFACE_TOKEN",
+            "HF_AUTH_TOKEN",
+            "HUGGINGFACEHUB_API_TOKEN",
+        ):
+            token = os.environ.get(env_var)
+            if token:
+                return token
+        return None
+
+    def _resolve_pretrained_checkpoint(self, source: str | Path, hf_token: str | None = None) -> Path:
+        path = Path(source)
+        if path.is_file():
+            return path
+        if path.is_dir():
+            raise ValueError(f"Expected a file for pretrained weights, received directory '{path}'.")
+
+        if not isinstance(source, str):
+            raise FileNotFoundError(f"Could not resolve pretrained weights from '{source}'.")
+
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:
+            raise ImportError(
+                "huggingface_hub must be installed to download pretrained weights by repo id."
+            ) from exc
+
+        filename = getattr(self.cfg.student, "pretrained_weights_file", "model.safetensors")
+        try:
+            if hf_token:
+                logger.info("Authenticating to Hugging Face Hub with provided token to fetch pretrained weights.")
+            local_path = hf_hub_download(repo_id=source, filename=filename, token=hf_token)
+        except Exception as exc:
+            raise FileNotFoundError(
+                f"Unable to download '{filename}' from Hugging Face repo '{source}'."
+            ) from exc
+        return Path(local_path)
+
+    def _load_state_dict_from_path(self, checkpoint_path: Path) -> dict:
+        if checkpoint_path.suffix == ".safetensors":
+            try:
+                from safetensors.torch import load_file as safetensors_load_file
+            except ImportError as exc:
+                raise ImportError(
+                    "safetensors must be installed to load '.safetensors' checkpoints."
+                ) from exc
+            state_dict = safetensors_load_file(str(checkpoint_path), device="cpu")
+        else:
+            state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+        if not isinstance(state_dict, dict):
+            raise TypeError(f"Expected state dict to be a dict, got {type(state_dict)}")
+
+        if "teacher" in state_dict and isinstance(state_dict["teacher"], dict):
+            state_dict = state_dict["teacher"]
+        elif "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+            state_dict = state_dict["state_dict"]
+
+        if all(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+        if all(k.startswith("model.") for k in state_dict.keys()):
+            state_dict = {f"backbone.{k[len('model.'):]}": v for k, v in state_dict.items()}
+
+        if not any(k.startswith("backbone.") for k in state_dict.keys()):
+            backbone_keys = set(self.student.backbone.state_dict().keys())
+            if all(k in backbone_keys for k in state_dict.keys()):
+                state_dict = {f"backbone.{k}": v for k, v in state_dict.items()}
+
+        # Only keep keys that belong to the student ModuleDict.
+        valid_prefixes = ("backbone.", "dino_head.", "ibot_head.")
+        state_dict = {k: v for k, v in state_dict.items() if k.startswith(valid_prefixes)}
+        return state_dict
 
     def forward_backward(
         self, data, *, teacher_temp, iteration=0, **ignored_kwargs

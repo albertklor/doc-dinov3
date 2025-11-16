@@ -51,6 +51,12 @@ def get_args_parser(add_help: bool = True):
     parser = argparse.ArgumentParser("DINOv3 training", add_help=add_help)
     parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
     parser.add_argument(
+        "--hf-token",
+        default=None,
+        type=str,
+        help="Hugging Face token with access to pretrained weights (kept in-memory only).",
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Whether to not attempt to resume from the checkpoint directory. ",
@@ -586,6 +592,12 @@ def main(argv=None):
     else:
         args = get_args_parser().parse_args(argv[1:])
         args.output_dir = sys.argv[1]
+
+    hf_token = getattr(args, "hf_token", None)
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    args.hf_token = None
+
     if args.multi_distillation:
         print("performing multidistillation run")
         cfg = setup_multidistillation(args)
